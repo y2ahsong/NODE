@@ -1,0 +1,1631 @@
+/home/safeai24/yjung/torchdiffeq/examples/odenet_mnist.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet', 'rknet', 'mlp'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./tab1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=2)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+def norm(dim):
+    return nn.GroupNorm(min(32, dim), dim)
+
+
+class ResBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.norm1 = norm(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.norm2 = norm(planes)
+        self.conv2 = conv3x3(planes, planes)
+
+    def forward(self, x):
+        shortcut = x
+
+        out = self.relu(self.norm1(x))
+
+        if self.downsample is not None:
+            shortcut = self.downsample(out)
+
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + shortcut
+
+
+class ConcatConv2d(nn.Module):
+
+    def __init__(self, dim_in, dim_out, ksize=3, stride=1, padding=0, dilation=1, groups=1, bias=True, transpose=False):
+        super(ConcatConv2d, self).__init__()
+        module = nn.ConvTranspose2d if transpose else nn.Conv2d
+        self._layer = module(
+            dim_in + 1, dim_out, kernel_size=ksize, stride=stride, padding=padding, dilation=dilation, groups=groups,
+            bias=bias
+        )
+
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1, :, :]) * t
+        ttx = torch.cat([tt, x], 1)
+        return self._layer(ttx)
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(ODEfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.norm1(x)
+        out = self.relu(out)
+        out = self.conv1(t, out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(t, out)
+        out = self.norm3(out)
+        return out
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RKfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(RKfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        k1 = self.conv1(t, x)
+        k2 = self.conv1(t, x + 0.5 * k1)
+        k3 = self.conv1(t, x + 0.5 * k2)
+        k4 = self.conv1(t, x + k3)
+        return x + (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+
+class RKBlock(nn.Module):
+
+    def __init__(self, rkfunc):
+        super(RKBlock, self).__init__()
+        self.rkfunc = rkfunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.rkfunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.rkfunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.rkfunc.nfe = value
+
+
+class OneLayerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(OneLayerMLP, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class Flatten(nn.Module):
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        shape = torch.prod(torch.tensor(x.shape[1:])).item()
+        return x.view(-1, shape)
+
+
+class RunningAverageMeter(object):
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_mnist_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_train), batch_size=batch_size,
+        shuffle=True, num_workers=2, drop_last=True
+    )
+
+    train_eval_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    test_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=False, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    return train_loader, test_loader, train_eval_loader
+
+
+def inf_generator(iterable):
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        y = one_hot(np.array(y.numpy()), 10)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    save_path = os.path.join(args.save, args.network)
+    makedirs(save_path)
+    logger = get_logger(logpath=os.path.join(save_path, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    print(device)
+    is_odenet = args.network == 'odenet'
+
+    if args.downsampling_method == 'conv':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+        ]
+    elif args.downsampling_method == 'res':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+        ]
+
+    if args.network == 'odenet':
+        feature_layers = [ODEBlock(ODEfunc(64))]
+    elif args.network == 'resnet':
+        feature_layers = [ResBlock(64, 64) for _ in range(6)]
+    elif args.network == 'rknet':
+        feature_layers = [RKBlock(RKfunc(64))]
+    elif args.network == 'mlp':
+        model = OneLayerMLP(28 * 28, 10).to(device)
+        feature_layers = []
+    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+
+    if args.network != 'mlp':
+        model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader, train_eval_loader = get_mnist_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(model, train_eval_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(save_path, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+
+Namespace(network='mlp', tol=0.001, adjoint=False, downsampling_method='conv', nepochs=160, data_aug=True, lr=0.1, batch_size=128, test_batch_size=1000, save='./tab1', debug=False, gpu=2)
+/home/safeai24/yjung/torchdiffeq/examples/odenet_mnist.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet', 'rknet', 'mlp'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./tab1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=1)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+def norm(dim):
+    return nn.GroupNorm(min(32, dim), dim)
+
+
+class ResBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.norm1 = norm(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.norm2 = norm(planes)
+        self.conv2 = conv3x3(planes, planes)
+
+    def forward(self, x):
+        shortcut = x
+
+        out = self.relu(self.norm1(x))
+
+        if self.downsample is not None:
+            shortcut = self.downsample(out)
+
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + shortcut
+
+
+class ConcatConv2d(nn.Module):
+
+    def __init__(self, dim_in, dim_out, ksize=3, stride=1, padding=0, dilation=1, groups=1, bias=True, transpose=False):
+        super(ConcatConv2d, self).__init__()
+        module = nn.ConvTranspose2d if transpose else nn.Conv2d
+        self._layer = module(
+            dim_in + 1, dim_out, kernel_size=ksize, stride=stride, padding=padding, dilation=dilation, groups=groups,
+            bias=bias
+        )
+
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1, :, :]) * t
+        ttx = torch.cat([tt, x], 1)
+        return self._layer(ttx)
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(ODEfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.norm1(x)
+        out = self.relu(out)
+        out = self.conv1(t, out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(t, out)
+        out = self.norm3(out)
+        return out
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RKfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(RKfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        k1 = self.conv1(t, x)
+        k2 = self.conv1(t, x + 0.5 * k1)
+        k3 = self.conv1(t, x + 0.5 * k2)
+        k4 = self.conv1(t, x + k3)
+        return x + (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+
+class RKBlock(nn.Module):
+
+    def __init__(self, rkfunc):
+        super(RKBlock, self).__init__()
+        self.rkfunc = rkfunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.rkfunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.rkfunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.rkfunc.nfe = value
+
+
+class OneLayerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(OneLayerMLP, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        return self.fc(x)
+
+
+class Flatten(nn.Module):
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        shape = torch.prod(torch.tensor(x.shape[1:])).item()
+        return x.view(-1, shape)
+
+
+class RunningAverageMeter(object):
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_mnist_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_train), batch_size=batch_size,
+        shuffle=True, num_workers=2, drop_last=True
+    )
+
+    train_eval_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    test_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=False, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    return train_loader, test_loader, train_eval_loader
+
+
+def inf_generator(iterable):
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        y = one_hot(np.array(y.numpy()), 10)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    save_path = os.path.join(args.save, args.network)
+    makedirs(save_path)
+    logger = get_logger(logpath=os.path.join(save_path, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    print(device)
+    is_odenet = args.network == 'odenet'
+
+    if args.downsampling_method == 'conv':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+        ]
+    elif args.downsampling_method == 'res':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+        ]
+
+    if args.network == 'odenet':
+        feature_layers = [ODEBlock(ODEfunc(64))]
+    elif args.network == 'resnet':
+        feature_layers = [ResBlock(64, 64) for _ in range(6)]
+    elif args.network == 'rknet':
+        feature_layers = [RKBlock(RKfunc(64))]
+    elif args.network == 'mlp':
+        model = OneLayerMLP(28 * 28, 10).to(device)
+        feature_layers = []
+    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+
+    if args.network != 'mlp':
+        model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader, train_eval_loader = get_mnist_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(model, train_eval_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(save_path, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+
+Namespace(network='mlp', tol=0.001, adjoint=False, downsampling_method='conv', nepochs=160, data_aug=True, lr=0.1, batch_size=128, test_batch_size=1000, save='./tab1', debug=False, gpu=1)
+OneLayerMLP(
+  (fc): Linear(in_features=784, out_features=10, bias=True)
+)
+Number of parameters: 7850
+Epoch 0000 | Time 0.159 (0.159) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.1120 | Test Acc 0.1140
+Epoch 0001 | Time 0.120 (0.008) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6140 | Test Acc 0.6371
+Epoch 0002 | Time 0.112 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6264 | Test Acc 0.6452
+Epoch 0003 | Time 0.116 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5745 | Test Acc 0.5886
+Epoch 0004 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5978 | Test Acc 0.6062
+Epoch 0005 | Time 0.108 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5697 | Test Acc 0.5766
+Epoch 0006 | Time 0.106 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6237 | Test Acc 0.6267
+Epoch 0007 | Time 0.112 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5912 | Test Acc 0.6083
+Epoch 0008 | Time 0.107 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6236 | Test Acc 0.6372
+Epoch 0009 | Time 0.106 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6572 | Test Acc 0.6692
+Epoch 0010 | Time 0.108 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6655 | Test Acc 0.6806
+Epoch 0011 | Time 0.104 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5758 | Test Acc 0.5813
+Epoch 0012 | Time 0.103 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6360 | Test Acc 0.6428
+Epoch 0013 | Time 0.090 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5572 | Test Acc 0.5608
+Epoch 0014 | Time 0.112 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6142 | Test Acc 0.6221
+Epoch 0015 | Time 0.087 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6212 | Test Acc 0.6317
+Epoch 0016 | Time 0.084 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6106 | Test Acc 0.6132
+Epoch 0017 | Time 0.100 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6363 | Test Acc 0.6437
+Epoch 0018 | Time 0.100 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5871 | Test Acc 0.5991
+Epoch 0019 | Time 0.114 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5709 | Test Acc 0.5788
+Epoch 0020 | Time 0.115 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6080 | Test Acc 0.6141
+Epoch 0021 | Time 0.101 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6238 | Test Acc 0.6354
+Epoch 0022 | Time 0.118 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6388 | Test Acc 0.6483
+Epoch 0023 | Time 0.108 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6284 | Test Acc 0.6452
+Epoch 0024 | Time 0.103 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6357 | Test Acc 0.6430
+Epoch 0025 | Time 0.094 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6159 | Test Acc 0.6376
+Epoch 0026 | Time 0.084 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6271 | Test Acc 0.6404
+Epoch 0027 | Time 0.091 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6184 | Test Acc 0.6330
+Epoch 0028 | Time 0.101 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6204 | Test Acc 0.6268
+Epoch 0029 | Time 0.095 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6180 | Test Acc 0.6228
+Epoch 0030 | Time 0.082 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6277 | Test Acc 0.6380
+Epoch 0031 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6252 | Test Acc 0.6340
+Epoch 0032 | Time 0.081 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6515 | Test Acc 0.6660
+Epoch 0033 | Time 0.095 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6470 | Test Acc 0.6624
+Epoch 0034 | Time 0.104 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6033 | Test Acc 0.6179
+Epoch 0035 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6190 | Test Acc 0.6300
+Epoch 0036 | Time 0.114 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6343 | Test Acc 0.6428
+Epoch 0037 | Time 0.100 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6461 | Test Acc 0.6643
+Epoch 0038 | Time 0.081 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6299 | Test Acc 0.6426
+Epoch 0039 | Time 0.085 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5949 | Test Acc 0.6096
+Epoch 0040 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6382 | Test Acc 0.6454
+Epoch 0041 | Time 0.093 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6253 | Test Acc 0.6428
+Epoch 0042 | Time 0.082 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5987 | Test Acc 0.6123
+Epoch 0043 | Time 0.113 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6223 | Test Acc 0.6259
+Epoch 0044 | Time 0.107 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6015 | Test Acc 0.6176
+Epoch 0045 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6233 | Test Acc 0.6256
+Epoch 0046 | Time 0.108 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6169 | Test Acc 0.6299
+Epoch 0047 | Time 0.094 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6221 | Test Acc 0.6384
+Epoch 0048 | Time 0.084 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6220 | Test Acc 0.6353
+Epoch 0049 | Time 0.089 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6172 | Test Acc 0.6343
+Epoch 0050 | Time 0.109 (0.008) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6344 | Test Acc 0.6546
+Epoch 0051 | Time 0.085 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6187 | Test Acc 0.6319
+Epoch 0052 | Time 0.107 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6250 | Test Acc 0.6331
+Epoch 0053 | Time 0.104 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6260 | Test Acc 0.6399
+Epoch 0054 | Time 0.090 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6285 | Test Acc 0.6321
+Epoch 0055 | Time 0.092 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6342 | Test Acc 0.6327
+Epoch 0056 | Time 0.122 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6265 | Test Acc 0.6340
+Epoch 0057 | Time 0.078 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6345 | Test Acc 0.6309
+Epoch 0058 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6410 | Test Acc 0.6443
+Epoch 0059 | Time 0.096 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6056 | Test Acc 0.6171
+Epoch 0060 | Time 0.082 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.5758 | Test Acc 0.5853
+Epoch 0061 | Time 0.110 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6790 | Test Acc 0.6901
+Epoch 0062 | Time 0.099 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6792 | Test Acc 0.6912
+Epoch 0063 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6680 | Test Acc 0.6809
+Epoch 0064 | Time 0.096 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6641 | Test Acc 0.6804
+Epoch 0065 | Time 0.102 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6669 | Test Acc 0.6840
+Epoch 0066 | Time 0.086 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6678 | Test Acc 0.6792
+Epoch 0067 | Time 0.107 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6744 | Test Acc 0.6886
+Epoch 0068 | Time 0.090 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6719 | Test Acc 0.6869
+Epoch 0069 | Time 0.101 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6758 | Test Acc 0.6876
+Epoch 0070 | Time 0.106 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6714 | Test Acc 0.6866
+Epoch 0071 | Time 0.089 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6613 | Test Acc 0.6738
+Epoch 0072 | Time 0.121 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6655 | Test Acc 0.6757
+Epoch 0073 | Time 0.086 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6753 | Test Acc 0.6894
+Epoch 0074 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6617 | Test Acc 0.6748
+Epoch 0075 | Time 0.104 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6727 | Test Acc 0.6861
+Epoch 0076 | Time 0.098 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6693 | Test Acc 0.6847
+Epoch 0077 | Time 0.101 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6774 | Test Acc 0.6921
+Epoch 0078 | Time 0.091 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6683 | Test Acc 0.6841
+Epoch 0079 | Time 0.159 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6747 | Test Acc 0.6859
+Epoch 0080 | Time 0.097 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6755 | Test Acc 0.6882
+Epoch 0081 | Time 0.098 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6689 | Test Acc 0.6858
+Epoch 0082 | Time 0.096 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6653 | Test Acc 0.6757
+Epoch 0083 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6672 | Test Acc 0.6803
+Epoch 0084 | Time 0.092 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6715 | Test Acc 0.6812
+Epoch 0085 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6798 | Test Acc 0.6970
+Epoch 0086 | Time 0.101 (0.008) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6722 | Test Acc 0.6862
+Epoch 0087 | Time 0.074 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6705 | Test Acc 0.6802
+Epoch 0088 | Time 0.106 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6726 | Test Acc 0.6896
+Epoch 0089 | Time 0.083 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6783 | Test Acc 0.6929
+Epoch 0090 | Time 0.111 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6819 | Test Acc 0.6939
+Epoch 0091 | Time 0.102 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6620 | Test Acc 0.6750
+Epoch 0092 | Time 0.118 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6525 | Test Acc 0.6650
+Epoch 0093 | Time 0.087 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6781 | Test Acc 0.6926
+Epoch 0094 | Time 0.095 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6679 | Test Acc 0.6836
+Epoch 0095 | Time 0.103 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6674 | Test Acc 0.6823
+Epoch 0096 | Time 0.094 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6667 | Test Acc 0.6797
+Epoch 0097 | Time 0.105 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6757 | Test Acc 0.6898
+Epoch 0098 | Time 0.091 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6785 | Test Acc 0.6943
+Epoch 0099 | Time 0.119 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6649 | Test Acc 0.6794
+Epoch 0100 | Time 0.085 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6699 | Test Acc 0.6832
+Epoch 0101 | Time 0.095 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6723 | Test Acc 0.6857
+Epoch 0102 | Time 0.108 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6728 | Test Acc 0.6886
+Epoch 0103 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6752 | Test Acc 0.6897
+Epoch 0104 | Time 0.085 (0.008) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6731 | Test Acc 0.6885
+Epoch 0105 | Time 0.103 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6792 | Test Acc 0.6930
+Epoch 0106 | Time 0.105 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6785 | Test Acc 0.6922
+Epoch 0107 | Time 0.096 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6748 | Test Acc 0.6898
+Epoch 0108 | Time 0.084 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6750 | Test Acc 0.6890
+Epoch 0109 | Time 0.085 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6784 | Test Acc 0.6916
+Epoch 0110 | Time 0.101 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6803 | Test Acc 0.6944
+Epoch 0111 | Time 0.085 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6798 | Test Acc 0.6939
+Epoch 0112 | Time 0.104 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6771 | Test Acc 0.6914
+Epoch 0113 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6817 | Test Acc 0.6947
+Epoch 0114 | Time 0.093 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6790 | Test Acc 0.6942
+Epoch 0115 | Time 0.105 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6777 | Test Acc 0.6922
+Epoch 0116 | Time 0.095 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6753 | Test Acc 0.6899
+Epoch 0117 | Time 0.114 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6754 | Test Acc 0.6892
+Epoch 0118 | Time 0.092 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6764 | Test Acc 0.6919
+Epoch 0119 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6756 | Test Acc 0.6898
+Epoch 0120 | Time 0.083 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6771 | Test Acc 0.6930
+Epoch 0121 | Time 0.113 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6771 | Test Acc 0.6911
+Epoch 0122 | Time 0.110 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6803 | Test Acc 0.6944
+Epoch 0123 | Time 0.098 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6785 | Test Acc 0.6902
+Epoch 0124 | Time 0.093 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6787 | Test Acc 0.6917
+Epoch 0125 | Time 0.100 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6754 | Test Acc 0.6872
+Epoch 0126 | Time 0.091 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6771 | Test Acc 0.6891
+Epoch 0127 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6768 | Test Acc 0.6913
+Epoch 0128 | Time 0.108 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6749 | Test Acc 0.6866
+Epoch 0129 | Time 0.103 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6753 | Test Acc 0.6894
+Epoch 0130 | Time 0.107 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6776 | Test Acc 0.6903
+Epoch 0131 | Time 0.107 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6766 | Test Acc 0.6912
+Epoch 0132 | Time 0.109 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6771 | Test Acc 0.6901
+Epoch 0133 | Time 0.107 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6773 | Test Acc 0.6910
+Epoch 0134 | Time 0.113 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6768 | Test Acc 0.6904
+Epoch 0135 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6754 | Test Acc 0.6870
+Epoch 0136 | Time 0.092 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6790 | Test Acc 0.6909
+Epoch 0137 | Time 0.098 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6790 | Test Acc 0.6912
+Epoch 0138 | Time 0.094 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6769 | Test Acc 0.6903
+Epoch 0139 | Time 0.100 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6776 | Test Acc 0.6877
+Epoch 0140 | Time 0.096 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6740 | Test Acc 0.6855
+Epoch 0141 | Time 0.088 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6765 | Test Acc 0.6888
+Epoch 0142 | Time 0.099 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6770 | Test Acc 0.6894
+Epoch 0143 | Time 0.089 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6768 | Test Acc 0.6895
+Epoch 0144 | Time 0.100 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6766 | Test Acc 0.6887
+Epoch 0145 | Time 0.111 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6767 | Test Acc 0.6889
+Epoch 0146 | Time 0.092 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6764 | Test Acc 0.6883
+Epoch 0147 | Time 0.117 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6770 | Test Acc 0.6893
+Epoch 0148 | Time 0.084 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6775 | Test Acc 0.6889
+Epoch 0149 | Time 0.112 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6774 | Test Acc 0.6899
+Epoch 0150 | Time 0.082 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6775 | Test Acc 0.6893
+Epoch 0151 | Time 0.109 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6773 | Test Acc 0.6887
+Epoch 0152 | Time 0.101 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6774 | Test Acc 0.6900
+Epoch 0153 | Time 0.088 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6775 | Test Acc 0.6901
+Epoch 0154 | Time 0.098 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6776 | Test Acc 0.6911
+Epoch 0155 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6779 | Test Acc 0.6904
+Epoch 0156 | Time 0.104 (0.007) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6782 | Test Acc 0.6909
+Epoch 0157 | Time 0.097 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6781 | Test Acc 0.6902
+Epoch 0158 | Time 0.106 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6785 | Test Acc 0.6903
+Epoch 0159 | Time 0.089 (0.006) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6787 | Test Acc 0.6913
+/home/safeai24/yjung/torchdiffeq/examples/odenet_mnist.py
+import os
+import argparse
+import logging
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader
+import torchvision.datasets as datasets
+import torchvision.transforms as transforms
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet', 'rknet', 'mlp'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+
+parser.add_argument('--save', type=str, default='./tab1')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+args = parser.parse_args()
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
+else:
+    from torchdiffeq import odeint
+
+
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+def conv1x1(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+def norm(dim):
+    return nn.GroupNorm(min(32, dim), dim)
+
+
+class ResBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.norm1 = norm(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.norm2 = norm(planes)
+        self.conv2 = conv3x3(planes, planes)
+
+    def forward(self, x):
+        shortcut = x
+
+        out = self.relu(self.norm1(x))
+
+        if self.downsample is not None:
+            shortcut = self.downsample(out)
+
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + shortcut
+
+
+class ConcatConv2d(nn.Module):
+
+    def __init__(self, dim_in, dim_out, ksize=3, stride=1, padding=0, dilation=1, groups=1, bias=True, transpose=False):
+        super(ConcatConv2d, self).__init__()
+        module = nn.ConvTranspose2d if transpose else nn.Conv2d
+        self._layer = module(
+            dim_in + 1, dim_out, kernel_size=ksize, stride=stride, padding=padding, dilation=dilation, groups=groups,
+            bias=bias
+        )
+
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1, :, :]) * t
+        ttx = torch.cat([tt, x], 1)
+        return self._layer(ttx)
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(ODEfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.norm1(x)
+        out = self.relu(out)
+        out = self.conv1(t, out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(t, out)
+        out = self.norm3(out)
+        return out
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class RKfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(RKfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        k1 = self.conv1(t, x)
+        k2 = self.conv1(t, x + 0.5 * k1)
+        k3 = self.conv1(t, x + 0.5 * k2)
+        k4 = self.conv1(t, x + k3)
+        return x + (k1 + 2 * k2 + 2 * k3 + k4) / 6
+
+
+class RKBlock(nn.Module):
+
+    def __init__(self, rkfunc):
+        super(RKBlock, self).__init__()
+        self.rkfunc = rkfunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.rkfunc, x, self.integration_time, rtol=1e-2, atol=1e-2)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.rkfunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.rkfunc.nfe = value
+
+
+class OneLayerMLP(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(OneLayerMLP, self).__init__()
+        self.fc = nn.Linear(input_dim, output_dim)
+        self.activation = nn.ReLU()
+        
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        x = self.activation(x)
+        return x
+
+
+class Flatten(nn.Module):
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        shape = torch.prod(torch.tensor(x.shape[1:])).item()
+        return x.view(-1, shape)
+
+
+class RunningAverageMeter(object):
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
+
+
+def get_mnist_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
+    if data_aug:
+        transform_train = transforms.Compose([
+            transforms.RandomCrop(28, padding=4),
+            transforms.ToTensor(),
+        ])
+    else:
+        transform_train = transforms.Compose([
+            transforms.ToTensor(),
+        ])
+
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_train), batch_size=batch_size,
+        shuffle=True, num_workers=2, drop_last=True
+    )
+
+    train_eval_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    test_loader = DataLoader(
+        datasets.MNIST(root='.data/mnist', train=False, download=True, transform=transform_test),
+        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
+    )
+
+    return train_loader, test_loader, train_eval_loader
+
+
+def inf_generator(iterable):
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+
+def accuracy(model, dataset_loader):
+    total_correct = 0
+    for x, y in dataset_loader:
+        x = x.to(device)
+        y = one_hot(np.array(y.numpy()), 10)
+
+        target_class = np.argmax(y, axis=1)
+        predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
+        total_correct += np.sum(predicted_class == target_class)
+    return total_correct / len(dataset_loader.dataset)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+
+if __name__ == '__main__':
+
+    save_path = os.path.join(args.save, args.network)
+    makedirs(save_path)
+    logger = get_logger(logpath=os.path.join(save_path, 'logs'), filepath=os.path.abspath(__file__))
+    logger.info(args)
+
+    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
+    print(device)
+    is_odenet = args.network == 'odenet'
+
+    if args.downsampling_method == 'conv':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+        ]
+    elif args.downsampling_method == 'res':
+        downsampling_layers = [
+            nn.Conv2d(1, 64, 3, 1),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+        ]
+
+    if args.network == 'odenet':
+        feature_layers = [ODEBlock(ODEfunc(64))]
+    elif args.network == 'resnet':
+        feature_layers = [ResBlock(64, 64) for _ in range(6)]
+    elif args.network == 'rknet':
+        feature_layers = [RKBlock(RKfunc(64))]
+    elif args.network == 'mlp':
+        model = OneLayerMLP(28 * 28, 10).to(device)
+        feature_layers = []
+    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+
+    if args.network != 'mlp':
+        model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+
+    logger.info(model)
+    logger.info('Number of parameters: {}'.format(count_parameters(model)))
+
+    criterion = nn.CrossEntropyLoss().to(device)
+
+    train_loader, test_loader, train_eval_loader = get_mnist_loaders(
+        args.data_aug, args.batch_size, args.test_batch_size
+    )
+
+    data_gen = inf_generator(train_loader)
+    batches_per_epoch = len(train_loader)
+
+    lr_fn = learning_rate_with_decay(
+        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+        decay_rates=[1, 0.1, 0.01, 0.001]
+    )
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+
+    best_acc = 0
+    batch_time_meter = RunningAverageMeter()
+    f_nfe_meter = RunningAverageMeter()
+    b_nfe_meter = RunningAverageMeter()
+    end = time.time()
+
+    for itr in range(args.nepochs * batches_per_epoch):
+
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr_fn(itr)
+
+        optimizer.zero_grad()
+        x, y = data_gen.__next__()
+        x = x.to(device)
+        y = y.to(device)
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        if is_odenet:
+            nfe_forward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        loss.backward()
+        optimizer.step()
+
+        if is_odenet:
+            nfe_backward = feature_layers[0].nfe
+            feature_layers[0].nfe = 0
+
+        batch_time_meter.update(time.time() - end)
+        if is_odenet:
+            f_nfe_meter.update(nfe_forward)
+            b_nfe_meter.update(nfe_backward)
+        end = time.time()
+
+        if itr % batches_per_epoch == 0:
+            with torch.no_grad():
+                train_acc = accuracy(model, train_eval_loader)
+                val_acc = accuracy(model, test_loader)
+                if val_acc > best_acc:
+                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(save_path, 'model.pth'))
+                    best_acc = val_acc
+                logger.info(
+                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
+                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
+                        b_nfe_meter.avg, train_acc, val_acc
+                    )
+                )
+
+Namespace(network='mlp', tol=0.001, adjoint=False, downsampling_method='conv', nepochs=160, data_aug=True, lr=0.1, batch_size=128, test_batch_size=1000, save='./tab1', debug=False, gpu=0)
+OneLayerMLP(
+  (fc): Linear(in_features=784, out_features=10, bias=True)
+  (activation): ReLU()
+)
+Number of parameters: 7850
+Epoch 0000 | Time 0.196 (0.196) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.1464 | Test Acc 0.1525
+Epoch 0001 | Time 0.102 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7109 | Test Acc 0.7216
+Epoch 0002 | Time 0.093 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6534 | Test Acc 0.6648
+Epoch 0003 | Time 0.078 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6920 | Test Acc 0.7176
+Epoch 0004 | Time 0.101 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6846 | Test Acc 0.6904
+Epoch 0005 | Time 0.111 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7110 | Test Acc 0.7202
+Epoch 0006 | Time 0.103 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7204 | Test Acc 0.7282
+Epoch 0007 | Time 0.110 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7141 | Test Acc 0.7261
+Epoch 0008 | Time 0.090 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7059 | Test Acc 0.7151
+Epoch 0009 | Time 0.099 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7054 | Test Acc 0.7177
+Epoch 0010 | Time 0.095 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7299 | Test Acc 0.7364
+Epoch 0011 | Time 0.120 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7356 | Test Acc 0.7472
+Epoch 0012 | Time 0.108 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7280 | Test Acc 0.7431
+Epoch 0013 | Time 0.118 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7345 | Test Acc 0.7453
+Epoch 0014 | Time 0.101 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7079 | Test Acc 0.7215
+Epoch 0015 | Time 0.107 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7240 | Test Acc 0.7306
+Epoch 0016 | Time 0.085 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7453 | Test Acc 0.7565
+Epoch 0017 | Time 0.116 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7187 | Test Acc 0.7278
+Epoch 0018 | Time 0.102 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7249 | Test Acc 0.7394
+Epoch 0019 | Time 0.106 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7428 | Test Acc 0.7611
+Epoch 0020 | Time 0.083 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7232 | Test Acc 0.7314
+Epoch 0021 | Time 0.113 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7220 | Test Acc 0.7358
+Epoch 0022 | Time 0.108 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7016 | Test Acc 0.7073
+Epoch 0023 | Time 0.101 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7089 | Test Acc 0.7201
+Epoch 0024 | Time 0.102 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7169 | Test Acc 0.7294
+Epoch 0025 | Time 0.089 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7145 | Test Acc 0.7292
+Epoch 0026 | Time 0.086 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6943 | Test Acc 0.6974
+Epoch 0027 | Time 0.113 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7150 | Test Acc 0.7255
+Epoch 0028 | Time 0.112 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7204 | Test Acc 0.7285
+Epoch 0029 | Time 0.114 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7437 | Test Acc 0.7545
+Epoch 0030 | Time 0.114 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7252 | Test Acc 0.7404
+Epoch 0031 | Time 0.100 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7107 | Test Acc 0.7209
+Epoch 0032 | Time 0.104 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7142 | Test Acc 0.7288
+Epoch 0033 | Time 0.089 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7237 | Test Acc 0.7322
+Epoch 0034 | Time 0.114 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7382 | Test Acc 0.7429
+Epoch 0035 | Time 0.089 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7206 | Test Acc 0.7383
+Epoch 0036 | Time 0.101 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6969 | Test Acc 0.7092
+Epoch 0037 | Time 0.100 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7254 | Test Acc 0.7359
+Epoch 0038 | Time 0.108 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7431 | Test Acc 0.7455
+Epoch 0039 | Time 0.117 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6949 | Test Acc 0.7004
+Epoch 0040 | Time 0.110 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7327 | Test Acc 0.7483
+Epoch 0041 | Time 0.092 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7438 | Test Acc 0.7599
+Epoch 0042 | Time 0.094 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7395 | Test Acc 0.7504
+Epoch 0043 | Time 0.115 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7285 | Test Acc 0.7375
+Epoch 0044 | Time 0.086 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7303 | Test Acc 0.7401
+Epoch 0045 | Time 0.091 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7358 | Test Acc 0.7449
+Epoch 0046 | Time 0.095 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7157 | Test Acc 0.7254
+Epoch 0047 | Time 0.089 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7434 | Test Acc 0.7499
+Epoch 0048 | Time 0.111 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7231 | Test Acc 0.7359
+Epoch 0049 | Time 0.083 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7502 | Test Acc 0.7611
+Epoch 0050 | Time 0.092 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7084 | Test Acc 0.7144
+Epoch 0051 | Time 0.117 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7328 | Test Acc 0.7405
+Epoch 0052 | Time 0.113 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7160 | Test Acc 0.7204
+Epoch 0053 | Time 0.096 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.6927 | Test Acc 0.6927
+Epoch 0054 | Time 0.118 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7008 | Test Acc 0.7162
+Epoch 0055 | Time 0.106 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7222 | Test Acc 0.7255
+Epoch 0056 | Time 0.113 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7449 | Test Acc 0.7543
+Epoch 0057 | Time 0.107 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7405 | Test Acc 0.7497
+Epoch 0058 | Time 0.109 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7534 | Test Acc 0.7587
+Epoch 0059 | Time 0.101 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7365 | Test Acc 0.7449
+Epoch 0060 | Time 0.116 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7167 | Test Acc 0.7228
+Epoch 0061 | Time 0.101 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7518 | Test Acc 0.7619
+Epoch 0062 | Time 0.079 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7641 | Test Acc 0.7750
+Epoch 0063 | Time 0.085 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7614 | Test Acc 0.7726
+Epoch 0064 | Time 0.114 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7549 | Test Acc 0.7650
+Epoch 0065 | Time 0.108 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7526 | Test Acc 0.7624
+Epoch 0066 | Time 0.091 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7597 | Test Acc 0.7688
+Epoch 0067 | Time 0.096 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7589 | Test Acc 0.7704
+Epoch 0068 | Time 0.098 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7616 | Test Acc 0.7692
+Epoch 0069 | Time 0.113 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7594 | Test Acc 0.7716
+Epoch 0070 | Time 0.104 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7637 | Test Acc 0.7771
+Epoch 0071 | Time 0.107 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7624 | Test Acc 0.7728
+Epoch 0072 | Time 0.110 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7698 | Test Acc 0.7811
+Epoch 0073 | Time 0.096 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7705
+Epoch 0074 | Time 0.102 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7651 | Test Acc 0.7773
+Epoch 0075 | Time 0.099 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7632 | Test Acc 0.7777
+Epoch 0076 | Time 0.103 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7709
+Epoch 0077 | Time 0.094 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7594 | Test Acc 0.7685
+Epoch 0078 | Time 0.092 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7615 | Test Acc 0.7739
+Epoch 0079 | Time 0.095 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7578 | Test Acc 0.7665
+Epoch 0080 | Time 0.103 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7599 | Test Acc 0.7750
+Epoch 0081 | Time 0.122 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7584 | Test Acc 0.7698
+Epoch 0082 | Time 0.107 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7578 | Test Acc 0.7701
+Epoch 0083 | Time 0.098 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7606 | Test Acc 0.7752
+Epoch 0084 | Time 0.089 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7635 | Test Acc 0.7753
+Epoch 0085 | Time 0.090 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7561 | Test Acc 0.7705
+Epoch 0086 | Time 0.098 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7571 | Test Acc 0.7666
+Epoch 0087 | Time 0.084 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7533 | Test Acc 0.7656
+Epoch 0088 | Time 0.095 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7610 | Test Acc 0.7720
+Epoch 0089 | Time 0.106 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7573 | Test Acc 0.7697
+Epoch 0090 | Time 0.102 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7541 | Test Acc 0.7657
+Epoch 0091 | Time 0.088 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7551 | Test Acc 0.7619
+Epoch 0092 | Time 0.098 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7589 | Test Acc 0.7718
+Epoch 0093 | Time 0.093 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7625 | Test Acc 0.7734
+Epoch 0094 | Time 0.111 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7583 | Test Acc 0.7676
+Epoch 0095 | Time 0.084 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7523 | Test Acc 0.7626
+Epoch 0096 | Time 0.088 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7621 | Test Acc 0.7744
+Epoch 0097 | Time 0.113 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7532 | Test Acc 0.7645
+Epoch 0098 | Time 0.095 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7506 | Test Acc 0.7612
+Epoch 0099 | Time 0.094 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7552 | Test Acc 0.7656
+Epoch 0100 | Time 0.102 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7472 | Test Acc 0.7582
+Epoch 0101 | Time 0.106 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7586 | Test Acc 0.7718
+Epoch 0102 | Time 0.089 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7606 | Test Acc 0.7723
+Epoch 0103 | Time 0.102 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7616 | Test Acc 0.7739
+Epoch 0104 | Time 0.082 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7599 | Test Acc 0.7714
+Epoch 0105 | Time 0.093 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7582 | Test Acc 0.7716
+Epoch 0106 | Time 0.095 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7602 | Test Acc 0.7726
+Epoch 0107 | Time 0.102 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7720
+Epoch 0108 | Time 0.109 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7596 | Test Acc 0.7720
+Epoch 0109 | Time 0.111 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7595 | Test Acc 0.7731
+Epoch 0110 | Time 0.081 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7570 | Test Acc 0.7711
+Epoch 0111 | Time 0.081 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7603 | Test Acc 0.7730
+Epoch 0112 | Time 0.093 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7591 | Test Acc 0.7714
+Epoch 0113 | Time 0.112 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7595 | Test Acc 0.7719
+Epoch 0114 | Time 0.103 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7599 | Test Acc 0.7728
+Epoch 0115 | Time 0.101 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7605 | Test Acc 0.7738
+Epoch 0116 | Time 0.086 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7605 | Test Acc 0.7725
+Epoch 0117 | Time 0.079 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7595 | Test Acc 0.7726
+Epoch 0118 | Time 0.111 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7599 | Test Acc 0.7736
+Epoch 0119 | Time 0.092 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7600 | Test Acc 0.7727
+Epoch 0120 | Time 0.093 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7618 | Test Acc 0.7735
+Epoch 0121 | Time 0.112 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7617 | Test Acc 0.7740
+Epoch 0122 | Time 0.096 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7614 | Test Acc 0.7736
+Epoch 0123 | Time 0.107 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7620 | Test Acc 0.7735
+Epoch 0124 | Time 0.119 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7736
+Epoch 0125 | Time 0.081 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7611 | Test Acc 0.7741
+Epoch 0126 | Time 0.092 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7582 | Test Acc 0.7713
+Epoch 0127 | Time 0.105 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7595 | Test Acc 0.7720
+Epoch 0128 | Time 0.088 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7599 | Test Acc 0.7726
+Epoch 0129 | Time 0.099 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7607 | Test Acc 0.7749
+Epoch 0130 | Time 0.090 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7613 | Test Acc 0.7741
+Epoch 0131 | Time 0.124 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7609 | Test Acc 0.7732
+Epoch 0132 | Time 0.104 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7588 | Test Acc 0.7724
+Epoch 0133 | Time 0.113 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7595 | Test Acc 0.7747
+Epoch 0134 | Time 0.105 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7603 | Test Acc 0.7733
+Epoch 0135 | Time 0.090 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7608 | Test Acc 0.7713
+Epoch 0136 | Time 0.107 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7582 | Test Acc 0.7708
+Epoch 0137 | Time 0.101 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7589 | Test Acc 0.7718
+Epoch 0138 | Time 0.089 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7600 | Test Acc 0.7738
+Epoch 0139 | Time 0.096 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7581 | Test Acc 0.7710
+Epoch 0140 | Time 0.104 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7621 | Test Acc 0.7754
+Epoch 0141 | Time 0.089 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7609 | Test Acc 0.7743
+Epoch 0142 | Time 0.124 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7605 | Test Acc 0.7741
+Epoch 0143 | Time 0.109 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7605 | Test Acc 0.7743
+Epoch 0144 | Time 0.104 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7604 | Test Acc 0.7738
+Epoch 0145 | Time 0.099 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7600 | Test Acc 0.7730
+Epoch 0146 | Time 0.107 (0.015) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7729
+Epoch 0147 | Time 0.103 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7601 | Test Acc 0.7733
+Epoch 0148 | Time 0.103 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7597 | Test Acc 0.7733
+Epoch 0149 | Time 0.109 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7597 | Test Acc 0.7735
+Epoch 0150 | Time 0.088 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7601 | Test Acc 0.7729
+Epoch 0151 | Time 0.098 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7602 | Test Acc 0.7731
+Epoch 0152 | Time 0.094 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7601 | Test Acc 0.7734
+Epoch 0153 | Time 0.095 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7601 | Test Acc 0.7733
+Epoch 0154 | Time 0.099 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7733
+Epoch 0155 | Time 0.108 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7729
+Epoch 0156 | Time 0.085 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7597 | Test Acc 0.7728
+Epoch 0157 | Time 0.094 (0.014) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7598 | Test Acc 0.7725
+Epoch 0158 | Time 0.100 (0.013) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7601 | Test Acc 0.7730
+Epoch 0159 | Time 0.089 (0.012) | NFE-F 0.0 | NFE-B 0.0 | Train Acc 0.7600 | Test Acc 0.7728
