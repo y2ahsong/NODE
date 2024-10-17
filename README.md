@@ -1,6 +1,5 @@
 # Overview
-
-This repository contains scripts for experiments involving Neural Ordinary Differential Equations (Neural ODEs). These scripts demonstrate various applications of continuous-depth models, including MNIST classification and normalizing flows, using the torchdiffeq library.
+This repository contains scripts for experiments involving Neural Ordinary Differential Equations (Neural ODEs), based on the implementation from torchdiffeq. These experiments were conducted as part of the AI60301 Paper Presentation to explore various applications of continuous-depth models, including MNIST classification and normalizing flows.
 
 To install the necessary dependencies:
 ```
